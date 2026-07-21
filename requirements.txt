@@ -1,0 +1,25 @@
+# Hakili Transcription — Dépendances Python
+
+# --- Core ---
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+python-dotenv==1.0.1
+
+# --- Traitement image & PDF ---
+pillow>=10.4.0,<12.0.0
+pymupdf>=1.24.9
+
+# --- Génération PDF / Excel ---
+reportlab==4.2.2
+openpyxl>=3.1.0
+
+# --- Interface ---
+streamlit>=1.36.0
+pandas>=2.2.0
+
+# --- Fournisseurs IA ---
+google-genai>=2.0.0
+openai>=1.30.0
+
+# --- Réseau & robustesse ---
+tenacity==8.5.0
