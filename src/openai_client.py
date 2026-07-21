@@ -5,9 +5,7 @@ uniquement quand GeminiTranscriptionClient échoue.
 from __future__ import annotations
 
 import base64
-import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +13,8 @@ from openai import OpenAI
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.config import settings
-from src.models import AIResponse, TranscriptionResult
+from src.json_utils import parse_transcription_json
+from src.models import AIResponse
 
 logger = logging.getLogger(__name__)
 
@@ -26,57 +25,6 @@ _MEDIA_TYPES: dict[str, str] = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
-
-_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-_TRAILING_COMMA = re.compile(r",\s*([}\]])")
-
-
-def _repair_json(text: str) -> str:
-    stack: list[str] = []
-    in_string = False
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if c == "\\" and in_string:
-            i += 2
-            continue
-        if c == '"':
-            in_string = not in_string
-        elif not in_string:
-            if c in ("{", "["):
-                stack.append(c)
-            elif c in ("}", "]") and stack:
-                stack.pop()
-        i += 1
-    close_map = {"[": "]", "{": "}"}
-    return text + "".join(close_map[c] for c in reversed(stack))
-
-
-def _parse_json_response(raw: str) -> AIResponse:
-    text = raw.strip()
-    m = _JSON_FENCE.search(text)
-    if m:
-        text = m.group(1).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start:end + 1]
-    text = _TRAILING_COMMA.sub(r"\1", text)
-
-    for candidate in (text, _repair_json(text)):
-        candidate = _TRAILING_COMMA.sub(r"\1", candidate)
-        try:
-            data = json.loads(candidate)
-            validated = TranscriptionResult(**data)
-            return AIResponse(success=True, data=validated, confidence=0.85, raw_response=raw[:2000], error=None)
-        except (json.JSONDecodeError, Exception):
-            continue
-
-    logger.error("GPT-5 — JSON irréparable. Début : %.300s", raw)
-    return AIResponse(
-        success=False, data=None, confidence=0.0,
-        raw_response=raw[:500], error=f"JSON invalide retourné par GPT-5. Début : {raw[:200]}",
-    )
 
 
 def _is_retryable_openai(exc: BaseException) -> bool:
@@ -105,7 +53,9 @@ class OpenAIClient:
     def __init__(self) -> None:
         if not settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY manquante. Ajoutez-la dans .env pour le fallback GPT-5.")
-        self._client = OpenAI(api_key=settings.openai_api_key, timeout=90.0)
+        # Extraction de tableaux structurés sur plusieurs pages = réponse volumineuse
+        # + tokens de raisonnement GPT-5 invisibles → nettement plus long que 90s.
+        self._client = OpenAI(api_key=settings.openai_api_key, timeout=240.0)
         self._transcription_prompt = self._load_prompt("transcription_prompt.md")
         logger.info("OpenAIClient initialisé (modèle=%s)", settings.openai_model)
 
@@ -126,19 +76,24 @@ class OpenAIClient:
         }
 
     @_retry
-    def transcribe(self, doc_id: str, image_paths: list[Path]) -> AIResponse:
-        logger.info("[%s] GPT-5 transcription (fallback) — modèle : %s | pages : %d",
-                    doc_id, settings.openai_model, len(image_paths))
+    def transcribe(self, doc_id: str, image_paths: list[Path], page_offset: int = 0) -> AIResponse:
+        logger.info("[%s] GPT-5 transcription (fallback) — modèle : %s | pages : %d (offset=%d)",
+                    doc_id, settings.openai_model, len(image_paths), page_offset)
+        first_page = page_offset + 1
+        page_hint = (
+            f"\nCes images sont les pages {first_page} à {page_offset + len(image_paths)} du document."
+            if page_offset > 0 else ""
+        )
         schema_example = (
             '{\n'
             f'  "doc_id": "{doc_id}",\n'
             '  "global_quality": "good",\n'
             '  "pages": [\n'
-            '    {"page_number": 1, "content": "...", "uncertainties": [], "confidence": 0.9}\n'
+            f'    {{"page_number": {first_page}, "content": "...", "tables": [], "uncertainties": [], "confidence": 0.9}}\n'
             '  ]\n}'
         )
         prompt = (
-            f"{self._transcription_prompt}\n\ndoc_id : {doc_id}\n\n"
+            f"{self._transcription_prompt}\n\ndoc_id : {doc_id}{page_hint}\n\n"
             "Retourne UNIQUEMENT un objet JSON valide sans aucune balise markdown, "
             "avec cette structure exacte (une entrée dans `pages` par image fournie, dans l'ordre) :\n"
             f"{schema_example}"
@@ -151,12 +106,22 @@ class OpenAIClient:
                 model=settings.openai_model,
                 messages=[{"role": "user", "content": content}],
                 response_format={"type": "json_object"},
-                max_completion_tokens=8192,
+                # GPT-5 est un modèle de raisonnement : les tokens de raisonnement (invisibles)
+                # sont décomptés de max_completion_tokens. Avec les tableaux structurés, une
+                # limite trop basse peut consommer tout le budget en raisonnement et renvoyer
+                # un contenu vide — d'où une marge large.
+                max_completion_tokens=32768,
             )
             raw = response.choices[0].message.content or ""
             logger.info("GPT-5 transcription OK — tokens: %d in / %d out",
                         response.usage.prompt_tokens, response.usage.completion_tokens)
-            return _parse_json_response(raw)
+            if not raw:
+                logger.error(
+                    "GPT-5 a renvoyé un contenu vide (finish_reason=%s, completion_tokens=%d) — "
+                    "probablement tout le budget consommé par le raisonnement interne.",
+                    response.choices[0].finish_reason, response.usage.completion_tokens,
+                )
+            return parse_transcription_json(raw, page_offset, "GPT-5")
         except Exception as e:
             logger.error("GPT-5 transcribe erreur (doc_id=%s) : %s", doc_id, e)
             return AIResponse(success=False, data=None, confidence=0.0, raw_response="", error=str(e))

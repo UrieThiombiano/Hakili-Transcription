@@ -11,9 +11,17 @@ class IngestionResult(BaseModel):
     output_dir: Path
 
 
+class Table(BaseModel):
+    """Tableau détecté sur une page (ex : liste, tableau de données, grille)."""
+    title: str = ""
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+
+
 class PageTranscription(BaseModel):
     page_number: int
     content: str
+    tables: list[Table] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
 
